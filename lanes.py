@@ -74,6 +74,14 @@ class LanesMethodError(Exception):
     def __str__(self) -> str:
         return self.message
 
+class Request:
+    def __init__(self, method, path, headers, params, body=b""):
+        self.method = method
+        self.path = path
+        self.headers = headers
+        self.params = params
+        self.body = body
+
 class Lanes:
     def __init__(self, log_level=LOG_INFO):
         self.routes = {
@@ -175,9 +183,11 @@ class Lanes:
                     matched_route = route
                     break
             
+            # Function callback
             if matched:
                 callback = self.routes[method][matched_route]
-                res = callback(**params)
+                req = Request(method, path, headers, params)
+                res = callback(req)
             else:
                 await self.send_json(writer, HTTP_NOT_FOUND, {"message": "Page no found"})
                 return
