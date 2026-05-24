@@ -67,8 +67,6 @@ class Logger:
     def fatal(self, message):
         self.output(LOG_FATAL, "[FATAL]", message)
 
-logger = Logger(log_level=LOG_DEBUG)
-
 class LanesMethodError(Exception):
     def __init__(self, message, *args: object) -> None:
         super().__init__(*args)
@@ -77,13 +75,14 @@ class LanesMethodError(Exception):
         return self.message
 
 class Lanes:
-    def __init__(self):
+    def __init__(self, log_level=LOG_INFO):
         self.routes = {
             "GET": {},
             "POST": {},
             "PUT": {},
             "DELETE": {}
         }
+        self.logger = Logger(log_level)
         
     def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, body = "", headers = {}):
         writer.write(f"HTTP/1.1 {status} {HTTP_PHRASES[status]}\r\n".encode())
@@ -106,6 +105,27 @@ class Lanes:
         writer.write(body.encode())
         
         await writer.drain()
+    
+    def match_path(self, route: str, path: str):
+        route_chunk = route.split("/")
+        path_chunk = path.split("/")
+
+        params = {}
+
+        if len(route_chunk) != len(path_chunk):
+            return (False, params)
+        
+        for i in range(len(route_chunk)):
+            if (route_chunk[i].startswith(":")):
+                param_key = route_chunk[i].replace(":", "", 1)
+                param_val = path_chunk[i]
+
+                params[param_key] = param_val
+            else:
+                if route_chunk[i] != path_chunk[i]:
+                    return (False, params)
+        
+        return (True, params)
 
     async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -115,16 +135,17 @@ class Lanes:
             
             request_line = raw_line.decode().strip()
             headers = {}
-            logger.debug(f"request line: {request_line}")
+            self.logger.debug(f"request line: {request_line}")
 
             while True:
                 header_raw_line = await reader.readline()
                 if header_raw_line == b'\r\n' or header_raw_line == b'\n' or not header_raw_line:
                     break
                 header_line = header_raw_line.decode().strip()
-                header_chunk = header_line.split(":", 1)
+                if ":" in header_line:
+                    header_chunk = header_line.split(":", 1)
 
-                headers[header_chunk[0]] = header_chunk[1]
+                    headers[header_chunk[0]] = header_chunk[1]
             
             request_chunk = request_line.split(" ")
 
@@ -140,14 +161,26 @@ class Lanes:
                 await self.send_json(writer, HTTP_METHOD_NOT_ALLOWED, {"message": "Method not allowed"})
                 return
 
-            logger.debug(f"method: {method} path: {path} protocol: {protocol}")
+            self.logger.debug(f"method: {method} path: {path} protocol: {protocol}")
             
-            if path not in self.routes[method].keys():
-                await self.send_json(writer, HTTP_NOT_FOUND, {"message": "Resourace no found"})
+            params = {}
+            matched = False
+            matched_route = ""
+
+            for route in self.routes[method].keys():
+                match_result = self.match_path(route, path)
+                if match_result[0]:
+                    params = match_result[1]
+                    matched = True
+                    matched_route = route
+                    break
+            
+            if matched:
+                callback = self.routes[method][matched_route]
+                res = callback(**params)
+            else:
+                await self.send_json(writer, HTTP_NOT_FOUND, {"message": "Page no found"})
                 return
-            
-            callback = self.routes[method][path]
-            res = callback()
 
             if isinstance(res, (dict, list)):
                 await self.send_json(writer, HTTP_OK, res)
@@ -155,7 +188,7 @@ class Lanes:
                 await self.send_text(writer, HTTP_OK, str(res))
 
         except Exception as e:
-            logger.error(f"Handle request error: {e}")
+            self.logger.error(f"Handle request error: {e}")
         finally:
             writer.close()
             await writer.wait_closed()
@@ -200,7 +233,7 @@ class Lanes:
     
     async def run_server(self, host="0.0.0.0", port=80):
         server = await asyncio.start_server(self.handle_request, host, port)
-        logger.info("The server is running on: {}:{}".format(host, port))
+        self.logger.info("The server is running on: {}:{}".format(host, port))
         async with server:
             try:
                 await server.serve_forever()
@@ -209,19 +242,9 @@ class Lanes:
             finally:
                 server.close()
                 await server.wait_closed()
-                logger.info("Server is closed")
+                self.logger.info("================")
+                self.logger.info("Server is closed")
+                self.logger.info("================")
     
     def run(self, host="0.0.0.0", port=80):
         asyncio.run(self.run_server(host, port))
-
-lanes = Lanes()
-
-@lanes.get("/api/status")
-def get_status():
-    return {"status": "ok", "device": "esp32"}
-
-@lanes.get("/hello")
-def say_hello():
-    return "Hello World from Lanes!"
-
-lanes.run()
