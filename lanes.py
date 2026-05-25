@@ -1,7 +1,7 @@
 import time
 import asyncio
 import json
-from types import TracebackType
+import os
 
 try:
     from micropython import const # type: ignore
@@ -16,6 +16,8 @@ LOG_ERROR = const(3)
 LOG_FATAL = const(4)
 
 HTTP_OK                    = const(200)
+HTTP_CREATED               = const(201)
+HTTP_ACCEPTED              = const(202)
 HTTP_NO_CONTENT            = const(204)
 HTTP_NOT_MODIFIED          = const(304)
 HTTP_BAD_REQUEST           = const(400)
@@ -26,6 +28,8 @@ HTTP_SERVER_ERROR          = const(500)
 
 HTTP_PHRASES = {
     200: "OK",
+    201: "Created",
+    202: "Accepted",
     204: "No Content",
     304: "Not Modified",
     400: "Bad Request",
@@ -39,7 +43,20 @@ METHOD_GET = const("GET")
 METHOD_POST = const("POST")
 METHOD_PUT = const("PUT")
 METHOD_DELETE = const("DELETE")
-METHODS = const((METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE))
+METHOD_OPTIONS = const("OPTIONS")
+METHODS = const((METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE, METHOD_OPTIONS))
+
+MIME_TYPES = {
+    "plain": "text/plain; charset=utf-8",
+    "html": "text/html; charset=utf-8",
+    "css": "text/css",
+    "js": "application/javascript",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "ico": "image/x-icon",
+    "json": "application/json"
+}
 
 def get_time_str():
     t = time.localtime()
@@ -82,8 +99,19 @@ class Request:
         self.headers = headers
         self.params = params
         self.body = body
+        self.ctx = {}
 
 class Lanes:
+    config = {
+        "server": {
+            "host": str,
+            "port": int
+        },
+        "static": {
+            "path": str
+        }
+    }
+
     def __init__(self, log_level=LOG_INFO):
         self.routes = {
             "GET": {},
@@ -91,31 +119,64 @@ class Lanes:
             "PUT": {},
             "DELETE": {}
         }
+        self.static_routes = {}
+        self.middlewares = []
         self.logger = Logger(log_level)
+        self.config["static"]["path"] = "./assets"
+    
+    def static(self, url_prefix: str, folder_path: str):
+        if not url_prefix.startswith("/"):
+            url_prefix = "/" + url_prefix
+        if url_prefix.endswith("/") and url_prefix != "/":
+            url_prefix = url_prefix.rstrip("/")
+
+        self.static_routes[url_prefix] = folder_path
+        self.logger.info(f"Register static directory: {url_prefix} -> {folder_path}")
         
-    def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, body = "", headers = None):
+    def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, headers = None):
         headers = headers if headers is not None else {}
+        headers["Access-Control-Allow-Origin"] = "*"
+        headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        headers["Access-Control-Allow-Headers"] = "Content-Type"
 
         writer.write(f"HTTP/1.1 {status} {HTTP_PHRASES[status]}\r\n".encode())
-        writer.write(f"Content-Length: {len(body)}\r\n".encode())
-        writer.write(f"Allow: {METHOD_GET}, {METHOD_POST}, {METHOD_PUT}, {METHOD_DELETE}\r\n".encode())
+        writer.write(f"Allow: {METHOD_GET}, {METHOD_POST}, {METHOD_PUT}, {METHOD_DELETE}, {METHOD_OPTIONS}\r\n".encode())
         writer.write(b"Server: Lanes/1.0 (esp32)\r\n")
         for (key, value) in headers.items():
             writer.write(f"{key}: {value}\r\n".encode())
         writer.write(b"\r\n")
 
-    async def send_json(self, writer: asyncio.StreamWriter, status=HTTP_OK, data = None):
-        body = json.dumps(data)
-        self.make_header(writer, status, body, {"Content-Type": "application/json"})
-        writer.write(body.encode())
+    async def make_response(self, writer: asyncio.StreamWriter, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, ):
+        body = None
+        if mime_type == MIME_TYPES["json"]:
+            body = json.dumps(data)
+        else:
+            body=data
         
-        await writer.drain()
+        self.make_header(writer, status, { "Content-Length": len(body), "Content-Type": mime_type })
+        writer.write(body.encode())
 
-    async def send_text(self, writer: asyncio.StreamWriter, status=HTTP_OK, body: str = ""):
-        self.make_header(writer, status, body, {"Content-Type": "text/plain"})
-        writer.write(body.encode())
-        
         await writer.drain()
+    
+    async def send_file(self, writer: asyncio.StreamWriter, method, file_path):
+        self.logger.debug(f"target file path: {file_path}")
+
+        if not os.path.exists(file_path):
+                await self.make_response(writer, {"message": f"File not found"}, MIME_TYPES["json"], HTTP_NOT_FOUND)
+                self.logger.info(f"{method} {file_path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
+                return
+
+        file_ext = file_path.split(".")[-1]
+        content_type = MIME_TYPES.get(file_ext, "application/octet-stream")
+        self.make_header(writer, HTTP_OK, { "Content-Type": content_type })
+
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(1024)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
     
     def match_path(self, route: str, path: str):
         route_chunk = route.split("/")
@@ -161,7 +222,7 @@ class Lanes:
             request_chunk = request_line.split(" ")
 
             if len(request_chunk) != 3:
-                await self.send_json(writer, HTTP_BAD_REQUEST, {"message": "Bad request"})
+                await self.make_response(writer, {"message": "Bad request"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
                 return
             
             method = request_chunk[0].upper()
@@ -178,9 +239,17 @@ class Lanes:
                 path = raw_path_chunk[0]
                 query_string = raw_path_chunk[1]
 
+            if path.endswith("/") and path != "/":
+                path = path.removesuffix("/")
+
             if method not in METHODS:
                 self.logger.info(f"{method} {path} - {HTTP_METHOD_NOT_ALLOWED} {HTTP_PHRASES[HTTP_METHOD_NOT_ALLOWED]}")
-                await self.send_json(writer, HTTP_METHOD_NOT_ALLOWED, {"message": "Method not allowed"})
+                await self.make_response(writer, {"message": "Method not allowed"}, MIME_TYPES["json"], HTTP_METHOD_NOT_ALLOWED)
+                return
+            if method == METHOD_OPTIONS:
+                self.logger.info(f"{method} {path} - {HTTP_NO_CONTENT} {HTTP_PHRASES[HTTP_NO_CONTENT]}")
+                self.make_header(writer, HTTP_NO_CONTENT)
+                await writer.drain()
                 return
             
             self.logger.debug(f"method: {method} path: {path} protocol: {protocol}")
@@ -199,41 +268,91 @@ class Lanes:
 
             # Body handler
             content_length = int(headers.get("content-length", 0))
-            raw_body = b""
+            raw_body = b"{}"
             if content_length > 0:
                 raw_body = (await reader.read(content_length)).strip()
             self.logger.debug(raw_body)
 
-            body = json.loads(raw_body)
+            try:
+                body = json.loads(raw_body.decode())
+            except (SyntaxError, ValueError):
+                self.logger.info(f"{method} {path} - {HTTP_BAD_REQUEST} {HTTP_PHRASES[HTTP_BAD_REQUEST]}")
+                await self.make_response(writer, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_METHOD_NOT_ALLOWED)
+                return
 
             self.logger.debug(body)
 
+            # Params parse
             params = {}
+
+            if query_string != "":
+                params_chunk = query_string.split("&")
+                for raw_param in params_chunk:
+                    if "=" in raw_param:
+                        param_chunk = raw_param.split("=", 1)
+                        params[param_chunk[0]] = param_chunk[1]
+            
+            req = Request(method, path, headers, params, body)
+            for middleware in self.middlewares:
+                try:
+                    middleware(req)
+                except Exception as e:
+                    self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
+                    self.logger.error(f"An error occured: {e}")
+                    await self.make_response(writer, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
+                    return
             
             # Function callback
             if matched:
-                # Params parse
-                if query_string != "":
-                    params_chunk = query_string.split("&")
-                    for raw_param in params_chunk:
-                        if "=" in raw_param:
-                            param_chunk = raw_param.split("=", 1)
-                            params[param_chunk[0]] = param_chunk[1]
-
                 callback = self.routes[method][matched_route]
-                req = Request(method, path, headers, params, body)
-                res = callback(req, **route_params)
+                try:
+                    res = callback(req, **route_params)
+                except Exception as e:
+                    self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
+                    self.logger.error(f"An error occured: {e}")
+                    await self.make_response(writer, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
+                    return
             else:
-                await self.send_json(writer, HTTP_NOT_FOUND, {"message": f"Can not {method} {path}"})
-                self.logger.info(f"{method} {path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
+                target_file_path = None
+
+                for prefix, folder in self.static_routes.items():
+                    if path.startswith(prefix):
+                        rel_path = path[len(prefix):].lstrip("/")
+                        target_file_path = os.path.join(folder, rel_path)
+                        break
+                
+                if not target_file_path:
+                    rel_path = path.lstrip("/")
+                    target_file_path = os.path.join(self.config["static"]["path"], rel_path)
+                
+                await self.send_file(writer, method, target_file_path)
                 return
+            
+            res_content: str | dict | list = ""
+            status = HTTP_OK
 
-            if isinstance(res, (dict, list)):
-                await self.send_json(writer, HTTP_OK, res)
+            if isinstance(res, tuple):
+                if (len(res)) == 2:
+                    res_content = res[0]
+                    status = res[1]
+
+                    if status not in HTTP_PHRASES.keys():
+                        raise ValueError(f"Status {status} is not supported!")
+                else:
+                    raise TypeError("The length of tuple must be 2!")
             else:
-                await self.send_text(writer, HTTP_OK, str(res))
-            self.logger.info(f"{method} {path} - {HTTP_OK} {HTTP_PHRASES[HTTP_OK]}")
+                res_content = res
 
+            if isinstance(res_content, (dict, list)):
+                await self.make_response(writer, res_content, MIME_TYPES["json"], status)
+            else:
+                stripped_res = res_content.strip().lower()
+                if stripped_res.startswith("<html>") or stripped_res.startswith("<!doctype"):
+                    await self.make_response(writer, res_content, MIME_TYPES["html"], status)
+                else:
+                    await self.make_response(writer, res_content, MIME_TYPES["plain"], status)
+            
+            self.logger.info(f"{method} {path} - {status} {HTTP_PHRASES[status]}")
         except Exception as e:
             self.logger.error(f"Handle request error: {e}")
         finally:
@@ -278,8 +397,18 @@ class Lanes:
             return func
         return wrapper
     
-    async def run_server(self, host="0.0.0.0", port=80):
+    # Middleware registery functions
+    def before_request(self):
+        def wrapper(func):
+            self.middlewares.append(func)
+            return func
+        return wrapper
+    
+    async def run_server(self):
+        host = self.config["server"]["host"]
+        port = self.config["server"]["port"]
         server = await asyncio.start_server(self.handle_request, host, port)
+
         self.logger.info("=======================================")
         self.logger.info("The server is running on: {}:{}".format(host, port))
         self.logger.info("=======================================")
@@ -292,9 +421,12 @@ class Lanes:
         finally:
             server.close()
             await server.wait_closed()
+
             self.logger.info("=================")
             self.logger.info("Server is closed")
             self.logger.info("=================")
     
     def run(self, host="0.0.0.0", port=80):
-        asyncio.run(self.run_server(host, port))
+        self.config["server"]["host"] = host
+        self.config["server"]["port"] = port
+        asyncio.run(self.run_server())
