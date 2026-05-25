@@ -94,7 +94,7 @@ class Lanes:
         
     def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, body = "", headers = None):
         headers = headers if headers is not None else {}
-        
+
         writer.write(f"HTTP/1.1 {status} {HTTP_PHRASES[status]}\r\n".encode())
         writer.write(f"Content-Length: {len(body)}\r\n".encode())
         writer.write(f"Allow: {METHOD_GET}, {METHOD_POST}, {METHOD_PUT}, {METHOD_DELETE}\r\n".encode())
@@ -266,18 +266,21 @@ class Lanes:
     
     async def run_server(self, host="0.0.0.0", port=80):
         server = await asyncio.start_server(self.handle_request, host, port)
+        self.logger.info("=======================================")
         self.logger.info("The server is running on: {}:{}".format(host, port))
-        async with server:
-            try:
-                await server.serve_forever()
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
-            finally:
-                server.close()
-                await server.wait_closed()
-                self.logger.info("================")
-                self.logger.info("Server is closed")
-                self.logger.info("================")
+        self.logger.info("=======================================")
+        
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            server.close()
+            await server.wait_closed()
+            self.logger.info("=================")
+            self.logger.info("Server is closed")
+            self.logger.info("=================")
     
     def run(self, host="0.0.0.0", port=80):
         asyncio.run(self.run_server(host, port))
