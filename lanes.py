@@ -85,13 +85,6 @@ class Logger:
     def fatal(self, message):
         self.output(LOG_FATAL, "[FATAL]", message)
 
-class LanesMethodError(Exception):
-    def __init__(self, message, *args: object) -> None:
-        super().__init__(*args)
-        self.message = message
-    def __str__(self) -> str:
-        return self.message
-
 class Request:
     def __init__(self, method, path, headers, params, body):
         self.method = method
@@ -100,6 +93,62 @@ class Request:
         self.params = params
         self.body = body
         self.ctx = {}
+
+class Blueprint:
+    def __init__(self, url_prefix: str = "/") -> None:
+        self.url_prefix = url_prefix
+        self.routes = {
+            "GET": {},
+            "POST": {},
+            "PUT": {},
+            "DELETE": {}
+        }
+        self.middlewares = []
+    
+    # Route registery functions
+    def register_route(self, method, path, callback):
+        if method not in METHODS:
+            raise ValueError(f"The method '{method}' is not allowed!")
+        self.routes[method][path] = callback
+    
+    def route(self, path, method=METHOD_GET):
+        if method not in METHODS:
+            raise ValueError(f"The method '{method}' is not allowed!")
+        def wrapper(func):
+            self.routes[method][path] = func
+            return func
+        return wrapper
+    
+    def get(self, path):
+        def wrapper(func):
+            self.routes["GET"][path] = func
+            return func
+        return wrapper
+
+    def post(self, path):
+        def wrapper(func):
+            self.routes["POST"][path] = func
+            return func
+        return wrapper
+    
+    def put(self, path):
+        def wrapper(func):
+            self.routes["PUT"][path] = func
+            return func
+        return wrapper
+    
+    def delete(self, path):
+        def wrapper(func):
+            self.routes["DELETE"][path] = func
+            return func
+        return wrapper
+    
+    # Middleware registery functions
+    def before_request(self):
+        def wrapper(func):
+            self.middlewares.append(func)
+            return func
+        return wrapper
 
 class Lanes:
     config = {
@@ -362,12 +411,12 @@ class Lanes:
     # Route registery functions
     def register_route(self, method, path, callback):
         if method not in METHODS:
-            raise LanesMethodError(f"The method '{method}' is not allowed!")
+            raise ValueError(f"The method '{method}' is not allowed!")
         self.routes[method][path] = callback
     
     def route(self, path, method=METHOD_GET):
         if method not in METHODS:
-            raise LanesMethodError(f"The method '{method}' is not allowed!")
+            raise ValueError(f"The method '{method}' is not allowed!")
         def wrapper(func):
             self.routes[method][path] = func
             return func
@@ -404,6 +453,20 @@ class Lanes:
             return func
         return wrapper
     
+    # Blueprint registery functions
+    def register_blueprint(self, blueprint: Blueprint):
+        url_prefix = blueprint.url_prefix
+        # Register routes
+        for method in blueprint.routes.keys():
+            for path in blueprint.routes[method].keys():
+                self.routes[method][url_prefix if path == "/" else url_prefix + path] = blueprint.routes[method][path]
+        
+        # Register middlewares
+        for middleware in blueprint.middlewares:
+            self.middlewares.append(middleware)
+
+        self.logger.info("Register blueprint: " + url_prefix)
+    
     async def run_server(self):
         host = self.config["server"]["host"]
         port = self.config["server"]["port"]
@@ -412,6 +475,8 @@ class Lanes:
         self.logger.info("=======================================")
         self.logger.info("The server is running on: {}:{}".format(host, port))
         self.logger.info("=======================================")
+
+        self.logger.debug(f"routes: {self.routes}")
         
         try:
             while True:
