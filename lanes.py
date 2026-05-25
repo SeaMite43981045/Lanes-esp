@@ -92,7 +92,9 @@ class Lanes:
         }
         self.logger = Logger(log_level)
         
-    def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, body = "", headers = {}):
+    def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, body = "", headers = None):
+        headers = headers if headers is not None else {}
+        
         writer.write(f"HTTP/1.1 {status} {HTTP_PHRASES[status]}\r\n".encode())
         writer.write(f"Content-Length: {len(body)}\r\n".encode())
         writer.write(f"Allow: {METHOD_GET}, {METHOD_POST}, {METHOD_PUT}, {METHOD_DELETE}\r\n".encode())
@@ -126,7 +128,7 @@ class Lanes:
         for i in range(len(route_chunk)):
             if (route_chunk[i].startswith(":")):
                 param_key = route_chunk[i].replace(":", "", 1)
-                param_val = path_chunk[i]
+                param_val = path_chunk[i].split("?", 1)[0]
 
                 params[param_key] = param_val
             else:
@@ -162,32 +164,53 @@ class Lanes:
                 return
             
             method = request_chunk[0].upper()
-            path = request_chunk[1]
+            raw_path = request_chunk[1]
             protocol = request_chunk[2]
 
             if method not in METHODS:
                 await self.send_json(writer, HTTP_METHOD_NOT_ALLOWED, {"message": "Method not allowed"})
                 return
+            
+            path = ""
+            query_string = ""
+            raw_path_chunk = raw_path.split("?", 1)
+
+            if len(raw_path_chunk) == 1:
+                path = raw_path
+            else:
+                path = raw_path_chunk[0]
+                query_string = raw_path_chunk[1]
 
             self.logger.debug(f"method: {method} path: {path} protocol: {protocol}")
             
-            params = {}
+            route_params = {}
             matched = False
             matched_route = ""
 
             for route in self.routes[method].keys():
                 match_result = self.match_path(route, path)
                 if match_result[0]:
-                    params = match_result[1]
+                    route_params = match_result[1]
                     matched = True
                     matched_route = route
                     break
+
+            params = {}
             
             # Function callback
             if matched:
+                # Params parse
+
+                if query_string != "":
+                    params_chunk = query_string.split("&")
+                    for raw_param in params_chunk:
+                        if "=" in raw_param:
+                            param_chunk = raw_param.split("=", 1)
+                            params[param_chunk[0]] = param_chunk[1]
+
                 callback = self.routes[method][matched_route]
                 req = Request(method, path, headers, params)
-                res = callback(req)
+                res = callback(req, **route_params)
             else:
                 await self.send_json(writer, HTTP_NOT_FOUND, {"message": "Page no found"})
                 return
