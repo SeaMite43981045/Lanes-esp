@@ -86,13 +86,50 @@ class Logger:
         self.output(LOG_FATAL, "[FATAL]", message)
 
 class Request:
-    def __init__(self, method, path, headers, params, body):
+    def __init__(self, method, path, headers: dict, params, body):
         self.method = method
         self.path = path
         self.headers = headers
         self.params = params
         self.body = body
         self.ctx = {}
+        self.cookies = {}
+
+        self._parse_cookies()
+    
+    def _parse_cookies(self):
+        raw_cookie: str = self.headers.get("cookie", "")
+
+        if not raw_cookie or raw_cookie == "":
+            return
+        
+        parts = raw_cookie.split(";")
+        for part in parts:
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                self.cookies[k] = v
+
+class Response:
+    def __init__(self, body, status: int = HTTP_OK) -> None:
+        self.body = body
+        self.status = status
+        self._cookies = []
+
+    def set_cookie(self, key, value, max_age=None, path="/", httponly=False, secure=False):
+        cookie_parts = [f"{key}={value}"]
+        
+        if path:
+            cookie_parts.append(f"Path={path}")
+        if max_age is not None:
+            cookie_parts.append(f"Max-Age={max_age}")
+        if httponly:
+            cookie_parts.append("HttpOnly")
+        if secure:
+            cookie_parts.append("Secure")
+            
+        cookie_str = "; ".join(cookie_parts)
+        self._cookies.append(cookie_str)
 
 class Blueprint:
     def __init__(self, url_prefix: str = "/") -> None:
@@ -188,21 +225,32 @@ class Lanes:
         headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         headers["Access-Control-Allow-Headers"] = "Content-Type"
 
-        writer.write(f"HTTP/1.1 {status} {HTTP_PHRASES[status]}\r\n".encode())
+        writer.write(f"HTTP/1.1 {status} {HTTP_PHRASES.get(status, "Unknown")}\r\n".encode())
         writer.write(f"Allow: {METHOD_GET}, {METHOD_POST}, {METHOD_PUT}, {METHOD_DELETE}, {METHOD_OPTIONS}\r\n".encode())
         writer.write(b"Server: Lanes/1.0 (esp32)\r\n")
-        for (key, value) in headers.items():
-            writer.write(f"{key}: {value}\r\n".encode())
+
+        for key, value in headers.items():
+            if isinstance(value, (list, tuple)):
+                for val in value:
+                    writer.write(f"{key}: {val}\r\n".encode("utf-8"))
+            else:
+                writer.write(f"{key}: {value}\r\n".encode("utf-8"))
+                
         writer.write(b"\r\n")
 
-    async def make_response(self, writer: asyncio.StreamWriter, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, ):
+    async def make_response(self, writer: asyncio.StreamWriter, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, headers = None):
         body = None
+        headers = headers if headers is not None else {}
+        
         if mime_type == MIME_TYPES["json"]:
             body = json.dumps(data)
         else:
             body=data
+
+        headers["Content-Length"] = len(body)
+        headers["Content-Type"] = mime_type
         
-        self.make_header(writer, status, { "Content-Length": len(body), "Content-Type": mime_type })
+        self.make_header(writer, status, headers)
         writer.write(body.encode())
 
         await writer.drain()
@@ -379,8 +427,16 @@ class Lanes:
             
             res_content: str | dict | list = ""
             status = HTTP_OK
+            headers = {}
 
-            if isinstance(res, tuple):
+            if isinstance(res, Response):
+                res_content = res.body
+                status = res.status
+                headers = headers
+
+                if res._cookies:
+                    headers["Set-Cookie"] = res._cookies
+            elif isinstance(res, tuple):
                 if (len(res)) == 2:
                     res_content = res[0]
                     status = res[1]
@@ -393,13 +449,13 @@ class Lanes:
                 res_content = res
 
             if isinstance(res_content, (dict, list)):
-                await self.make_response(writer, res_content, MIME_TYPES["json"], status)
+                await self.make_response(writer, res_content, MIME_TYPES["json"], status, headers)
             else:
                 stripped_res = res_content.strip().lower()
                 if stripped_res.startswith("<html>") or stripped_res.startswith("<!doctype"):
-                    await self.make_response(writer, res_content, MIME_TYPES["html"], status)
+                    await self.make_response(writer, res_content, MIME_TYPES["html"], status, headers)
                 else:
-                    await self.make_response(writer, res_content, MIME_TYPES["plain"], status)
+                    await self.make_response(writer, res_content, MIME_TYPES["plain"], status, headers)
             
             self.logger.info(f"{method} {path} - {status} {HTTP_PHRASES[status]}")
         except Exception as e:
