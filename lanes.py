@@ -1,6 +1,7 @@
 import time
 import asyncio
 import json
+from types import TracebackType
 
 try:
     from micropython import const # type: ignore
@@ -75,7 +76,7 @@ class LanesMethodError(Exception):
         return self.message
 
 class Request:
-    def __init__(self, method, path, headers, params, body=b""):
+    def __init__(self, method, path, headers, params, body):
         self.method = method
         self.path = path
         self.headers = headers
@@ -155,7 +156,7 @@ class Lanes:
                 if ":" in header_line:
                     header_chunk = header_line.split(":", 1)
 
-                    headers[header_chunk[0]] = header_chunk[1]
+                    headers[header_chunk[0].strip().lower()] = header_chunk[1].strip()
             
             request_chunk = request_line.split(" ")
 
@@ -166,10 +167,6 @@ class Lanes:
             method = request_chunk[0].upper()
             raw_path = request_chunk[1]
             protocol = request_chunk[2]
-
-            if method not in METHODS:
-                await self.send_json(writer, HTTP_METHOD_NOT_ALLOWED, {"message": "Method not allowed"})
-                return
             
             path = ""
             query_string = ""
@@ -181,6 +178,11 @@ class Lanes:
                 path = raw_path_chunk[0]
                 query_string = raw_path_chunk[1]
 
+            if method not in METHODS:
+                self.logger.info(f"{method} {path} - {HTTP_METHOD_NOT_ALLOWED} {HTTP_PHRASES[HTTP_METHOD_NOT_ALLOWED]}")
+                await self.send_json(writer, HTTP_METHOD_NOT_ALLOWED, {"message": "Method not allowed"})
+                return
+            
             self.logger.debug(f"method: {method} path: {path} protocol: {protocol}")
             
             route_params = {}
@@ -195,12 +197,22 @@ class Lanes:
                     matched_route = route
                     break
 
+            # Body handler
+            content_length = int(headers.get("content-length", 0))
+            raw_body = b""
+            if content_length > 0:
+                raw_body = (await reader.read(content_length)).strip()
+            self.logger.debug(raw_body)
+
+            body = json.loads(raw_body)
+
+            self.logger.debug(body)
+
             params = {}
             
             # Function callback
             if matched:
                 # Params parse
-
                 if query_string != "":
                     params_chunk = query_string.split("&")
                     for raw_param in params_chunk:
@@ -209,16 +221,18 @@ class Lanes:
                             params[param_chunk[0]] = param_chunk[1]
 
                 callback = self.routes[method][matched_route]
-                req = Request(method, path, headers, params)
+                req = Request(method, path, headers, params, body)
                 res = callback(req, **route_params)
             else:
-                await self.send_json(writer, HTTP_NOT_FOUND, {"message": "Page no found"})
+                await self.send_json(writer, HTTP_NOT_FOUND, {"message": f"Can not {method} {path}"})
+                self.logger.info(f"{method} {path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
                 return
 
             if isinstance(res, (dict, list)):
                 await self.send_json(writer, HTTP_OK, res)
             else:
                 await self.send_text(writer, HTTP_OK, str(res))
+            self.logger.info(f"{method} {path} - {HTTP_OK} {HTTP_PHRASES[HTTP_OK]}")
 
         except Exception as e:
             self.logger.error(f"Handle request error: {e}")
