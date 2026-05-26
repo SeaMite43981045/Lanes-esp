@@ -1,0 +1,8 @@
+{
+    "name": "lanes",
+    "version": "1.0.0",
+    "description": "A simple and efficient Python web framework built on top of asyncio.",
+    "urls": [
+        ["src/lanes.py"]
+    ]
+}
