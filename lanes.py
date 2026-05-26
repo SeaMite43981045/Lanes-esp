@@ -9,6 +9,8 @@ except ImportError:
     def const(x):
         return x
 
+__version__ = "1.0-SNAPSHOT"
+
 LOG_DEBUG = const(0)
 LOG_INFO  = const(1)
 LOG_WARN  = const(2)
