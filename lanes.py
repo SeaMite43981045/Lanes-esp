@@ -209,6 +209,7 @@ class Lanes:
         }
         self.static_routes = {}
         self.middlewares = []
+        self.error_handlers = {}
         self.logger = Logger(log_level)
         self.config["static"]["path"] = "./assets"
     
@@ -261,20 +262,21 @@ class Lanes:
         self.logger.debug(f"target file path: {file_path}")
 
         if not os.path.exists(file_path):
-                await self.make_response(writer, {"message": f"File not found"}, MIME_TYPES["json"], HTTP_NOT_FOUND)
-                self.logger.info(f"{method} {file_path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
-                return
+            await self.make_response(writer, {"message": f"File not found"}, MIME_TYPES["json"], HTTP_NOT_FOUND)
+            self.logger.info(f"{method} {file_path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
+            return
 
         file_ext = file_path.split(".")[-1]
         content_type = MIME_TYPES.get(file_ext, "application/octet-stream")
         self.make_header(writer, HTTP_OK, { "Content-Type": content_type })
 
+        buffer = bytearray(1024)
         with open(file_path, "rb") as f:
             while True:
-                chunk = f.read(1024)
-                if not chunk:
+                n = f.readinto(buffer)
+                if n == 0:
                     break
-                writer.write(chunk)
+                writer.write(buffer[:n])
                 await writer.drain()
     
     def match_path(self, route: str, path: str):
@@ -374,9 +376,9 @@ class Lanes:
 
             try:
                 body = json.loads(raw_body.decode())
-            except (SyntaxError, ValueError):
+            except ValueError:
                 self.logger.info(f"{method} {path} - {HTTP_BAD_REQUEST} {HTTP_PHRASES[HTTP_BAD_REQUEST]}")
-                await self.make_response(writer, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_METHOD_NOT_ALLOWED)
+                await self.make_response(writer, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
                 return
 
             self.logger.debug(body)
@@ -429,12 +431,12 @@ class Lanes:
             
             res_content: str | dict | list = ""
             status = HTTP_OK
-            headers = {}
+            res_headers = {}
 
             if isinstance(res, Response):
                 res_content = res.body
                 status = res.status
-                headers = headers
+                res_headers = headers
 
                 if res._cookies:
                     headers["Set-Cookie"] = res._cookies
@@ -451,13 +453,13 @@ class Lanes:
                 res_content = res
 
             if isinstance(res_content, (dict, list)):
-                await self.make_response(writer, res_content, MIME_TYPES["json"], status, headers)
+                await self.make_response(writer, res_content, MIME_TYPES["json"], status, res_headers)
             else:
                 stripped_res = res_content.strip().lower()
                 if stripped_res.startswith("<html>") or stripped_res.startswith("<!doctype"):
-                    await self.make_response(writer, res_content, MIME_TYPES["html"], status, headers)
+                    await self.make_response(writer, res_content, MIME_TYPES["html"], status, res_headers)
                 else:
-                    await self.make_response(writer, res_content, MIME_TYPES["plain"], status, headers)
+                    await self.make_response(writer, res_content, MIME_TYPES["plain"], status, res_headers)
             
             self.logger.info(f"{method} {path} - {status} {HTTP_PHRASES[status]}")
         except Exception as e:
@@ -524,6 +526,18 @@ class Lanes:
             self.middlewares.append(middleware)
 
         self.logger.info("Register blueprint: " + url_prefix)
+    
+    # Error handler registery functions
+    def error_handler(self, status: int):
+        if status not in HTTP_PHRASES.keys():
+            raise ValueError(f"Status {status} is not supported!")
+        if not str(status).startswith(("4", "5")):
+            raise ValueError(f"Status {status} is not an error status!")
+        
+        def wrapper(func):
+            self.error_handlers[status] = func
+            return func
+        return wrapper
     
     async def run_server(self):
         host = self.config["server"]["host"]
