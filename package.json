@@ -1,6 +1,6 @@
 {
     "name": "lanes",
-    "version": "1.2.0-pre",
+    "version": "1.2.1-pre",
     "description": "A simple and efficient Python web framework built on top of asyncio.",
     "urls": [
         ["src/lanes.py", "lanes.py"]
