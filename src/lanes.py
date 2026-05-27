@@ -113,9 +113,13 @@ class Request:
                 self.cookies[k] = v
 
 class Response:
-    def __init__(self, body, status: int = HTTP_OK) -> None:
+    def __init__(self, body = None, headers = None, status: int = HTTP_OK, content_type = MIME_TYPES["plain"]) -> None:
+        headers = headers if not headers == None else {}
+
         self.body = body
+        self.headers = headers
         self.status = status
+        self.content_type = content_type
         self._cookies = []
 
     def set_cookie(self, key, value, max_age=None, path="/", httponly=False, secure=False):
@@ -258,11 +262,11 @@ class Lanes:
 
         await writer.drain()
     
-    async def send_file(self, writer: asyncio.StreamWriter, method, file_path):
+    async def send_file(self, writer: asyncio.StreamWriter, method, file_path, path):
         self.logger.debug(f"target file path: {file_path}")
 
         if not os.path.exists(file_path):
-            await self.make_response(writer, {"message": f"File not found"}, MIME_TYPES["json"], HTTP_NOT_FOUND)
+            await self.make_response(writer, {"message": f"Could not {method} {path}"}, MIME_TYPES["json"], HTTP_NOT_FOUND)
             self.logger.info(f"{method} {file_path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
             return
 
@@ -299,6 +303,20 @@ class Lanes:
                     return (False, params)
         
         return (True, params)
+    
+    async def handle_response(self, writer: asyncio.StreamWriter, response: Response):
+        status = response.status
+        headers = response.headers
+        body = response.body
+        content_type = response.content_type
+
+        if response._cookies:
+            headers["Set-Cookie"] = response._cookies
+
+        headers["Content-Type"] = content_type
+
+        await self.make_response(writer, body, content_type, status, headers)
+
 
     async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -407,7 +425,7 @@ class Lanes:
             if matched:
                 callback = self.routes[method][matched_route]
                 try:
-                    res = callback(req, **route_params)
+                    callback_result = callback(req, **route_params)
                 except Exception as e:
                     self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
                     self.logger.error(f"An error occured: {e}")
@@ -426,41 +444,30 @@ class Lanes:
                     rel_path = path.lstrip("/")
                     target_file_path = os.path.join(self.config["static"]["path"], rel_path)
                 
-                await self.send_file(writer, method, target_file_path)
+                await self.send_file(writer, method, target_file_path, path)
                 return
+            
+            response = Response()
             
             res_content: str | dict | list = ""
             status = HTTP_OK
             res_headers = {}
 
-            if isinstance(res, Response):
-                res_content = res.body
-                status = res.status
-                res_headers = headers
+            if isinstance(callback_result, tuple) and len(callback_result) == 2 and isinstance(callback_result[1], int):
+                response.status = callback_result[1]
+                callback_result = callback_result[0]
 
-                if res._cookies:
-                    headers["Set-Cookie"] = res._cookies
-            elif isinstance(res, tuple):
-                if (len(res)) == 2:
-                    res_content = res[0]
-                    status = res[1]
-
-                    if status not in HTTP_PHRASES.keys():
-                        raise ValueError(f"Status {status} is not supported!")
-                else:
-                    raise TypeError("The length of tuple must be 2!")
+            if isinstance(callback_result, Response):
+                response = callback_result
+            elif isinstance(callback_result, (dict, list)):
+                response.body = callback_result
+                response.content_type = MIME_TYPES["json"]
             else:
-                res_content = res
+                response.body = str(callback_result)
+                response.content_type = MIME_TYPES["plain"]
 
-            if isinstance(res_content, (dict, list)):
-                await self.make_response(writer, res_content, MIME_TYPES["json"], status, res_headers)
-            else:
-                stripped_res = res_content.strip().lower()
-                if stripped_res.startswith("<html>") or stripped_res.startswith("<!doctype"):
-                    await self.make_response(writer, res_content, MIME_TYPES["html"], status, res_headers)
-                else:
-                    await self.make_response(writer, res_content, MIME_TYPES["plain"], status, res_headers)
-            
+            await self.handle_response(writer, response)
+
             self.logger.info(f"{method} {path} - {status} {HTTP_PHRASES[status]}")
         except Exception as e:
             self.logger.error(f"Handle request error: {e}")
@@ -526,7 +533,7 @@ class Lanes:
             self.middlewares.append(middleware)
 
         self.logger.info("Register blueprint: " + url_prefix)
-    
+
     # Error handler registery functions
     def error_handler(self, status: int):
         if status not in HTTP_PHRASES.keys():
@@ -567,3 +574,19 @@ class Lanes:
         self.config["server"]["host"] = host
         self.config["server"]["port"] = port
         asyncio.run(self.run_server())
+
+
+def render_template(path: str, **params):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Template '{path}' not found!")
+    
+    with open(path, "r", encoding="utf-8") as f:
+        template = f.read()
+    
+    for key, value in params.items():
+        placeholder = "{{ " + key + " }}"
+        template = template.replace(placeholder, str(value))
+
+    res = Response(template, content_type=MIME_TYPES["html"])
+    
+    return res
