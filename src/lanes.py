@@ -28,6 +28,8 @@ HTTP_NOT_FOUND             = const(404)
 HTTP_METHOD_NOT_ALLOWED    = const(405)
 HTTP_SERVER_ERROR          = const(500)
 
+HTTP_ERROR_STATUSES = [HTTP_BAD_REQUEST, HTTP_UNAUTHORIZED, HTTP_NOT_FOUND, HTTP_METHOD_NOT_ALLOWED, HTTP_SERVER_ERROR]
+
 HTTP_PHRASES = {
     200: "OK",
     201: "Created",
@@ -204,6 +206,9 @@ class Lanes:
         }
     }
 
+    _dummy_generator_obj = (lambda: (yield))()
+    _GENERATOR_OBJECT_TYPE = type(_dummy_generator_obj)
+
     def __init__(self, log_level=LOG_INFO):
         self.routes = {
             "GET": {},
@@ -213,7 +218,7 @@ class Lanes:
         }
         self.static_routes = {}
         self.middlewares = []
-        self.error_handlers = {}
+        self.error_handlers: dict[int, list] = {}
         self.logger = Logger(log_level)
         self.config["static"]["path"] = "./assets"
     
@@ -262,12 +267,12 @@ class Lanes:
 
         await writer.drain()
     
-    async def send_file(self, writer: asyncio.StreamWriter, method, file_path, path):
+    async def send_file(self, writer: asyncio.StreamWriter, req: Request, method, file_path, path):
         self.logger.debug(f"target file path: {file_path}")
 
         if not os.path.exists(file_path):
-            await self.make_response(writer, {"message": f"Could not {method} {path}"}, MIME_TYPES["json"], HTTP_NOT_FOUND)
             self.logger.info(f"{method} {file_path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
+            await self.handle_error(writer, HTTP_NOT_FOUND, req, f"Could not {method} {path}")
             return
 
         file_ext = file_path.split(".")[-1]
@@ -304,6 +309,45 @@ class Lanes:
         
         return (True, params)
     
+    async def dispatch_request(self, handler, req, **kwargs):
+        res = handler(req, **kwargs)
+        
+        if isinstance(res, self._GENERATOR_OBJECT_TYPE):
+            actual_response = await res
+            return actual_response
+        else:
+            return res
+        
+    async def handle_error(self, writer: asyncio.StreamWriter, status: int, req: Request, error_message: str | None = None):
+        if error_message is None:
+            error_message = HTTP_PHRASES.get(status, "Unknown Error")
+        
+        handlers = self.error_handlers.get(status, [])
+
+        if handlers:
+            try:
+                for error_handler in handlers:
+                    callback_result = await self.dispatch_request(error_handler, req)
+                    
+                    if callback_result is not None:
+                        response = await self.get_response(callback_result)
+                        await self.handle_response(writer, response)
+                        return
+                    
+                await self.make_response(writer, {"message": error_message}, MIME_TYPES["json"], status)
+                return
+            except Exception as e:
+                self.logger.error(f"An error occurred in custom error handler: {e}")
+                if status != HTTP_SERVER_ERROR:
+                    await self.handle_error(writer, HTTP_SERVER_ERROR, req)
+                    return
+                else:
+                    await self.make_response(writer, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
+                    return
+        else:
+            await self.make_response(writer, {"message": error_message}, MIME_TYPES["json"], status)
+            return
+        
     async def handle_response(self, writer: asyncio.StreamWriter, response: Response):
         status = response.status
         headers = response.headers
@@ -316,7 +360,24 @@ class Lanes:
         headers["Content-Type"] = content_type
 
         await self.make_response(writer, body, content_type, status, headers)
+    
+    async def get_response(self, callback_result):
+        response = Response()
 
+        if isinstance(callback_result, tuple) and len(callback_result) == 2 and isinstance(callback_result[1], int):
+            response.status = callback_result[1]
+            callback_result = callback_result[0]
+
+        if isinstance(callback_result, Response):
+            response = callback_result
+        elif isinstance(callback_result, (dict, list)):
+            response.body = callback_result
+            response.content_type = MIME_TYPES["json"]
+        else:
+            response.body = str(callback_result)
+            response.content_type = MIME_TYPES["plain"]
+        
+        return response
 
     async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -360,16 +421,6 @@ class Lanes:
 
             if path.endswith("/") and path != "/":
                 path = path.removesuffix("/")
-
-            if method not in METHODS:
-                self.logger.info(f"{method} {path} - {HTTP_METHOD_NOT_ALLOWED} {HTTP_PHRASES[HTTP_METHOD_NOT_ALLOWED]}")
-                await self.make_response(writer, {"message": "Method not allowed"}, MIME_TYPES["json"], HTTP_METHOD_NOT_ALLOWED)
-                return
-            if method == METHOD_OPTIONS:
-                self.logger.info(f"{method} {path} - {HTTP_NO_CONTENT} {HTTP_PHRASES[HTTP_NO_CONTENT]}")
-                self.make_header(writer, HTTP_NO_CONTENT)
-                await writer.drain()
-                return
             
             self.logger.debug(f"method: {method} path: {path} protocol: {protocol}")
             
@@ -377,7 +428,7 @@ class Lanes:
             matched = False
             matched_route = ""
 
-            for route in self.routes[method].keys():
+            for route in self.routes[method]:
                 match_result = self.match_path(route, path)
                 if match_result[0]:
                     route_params = match_result[1]
@@ -412,24 +463,39 @@ class Lanes:
                         params[param_chunk[0]] = param_chunk[1]
             
             req = Request(method, path, headers, params, body)
+
+            if method not in METHODS:
+                self.logger.info(f"{method} {path} - {HTTP_METHOD_NOT_ALLOWED} {HTTP_PHRASES[HTTP_METHOD_NOT_ALLOWED]}")
+                await self.handle_error(writer, HTTP_METHOD_NOT_ALLOWED, req)
+                return
+            if method == METHOD_OPTIONS:
+                self.logger.info(f"{method} {path} - {HTTP_NO_CONTENT} {HTTP_PHRASES[HTTP_NO_CONTENT]}")
+                self.make_header(writer, HTTP_NO_CONTENT)
+                await writer.drain()
+                return
+            
+            # Middlewares
             for middleware in self.middlewares:
                 try:
-                    middleware(req)
+                    result = await self.dispatch_request(middleware, req)
+                    if result is not None:
+                        response = await self.get_response(result)
+                        await self.handle_response(writer, response)
+                        self.logger.info(f"{method} {path} - {response.status} {HTTP_PHRASES[response.status]}")
+                        return
                 except Exception as e:
                     self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
-                    self.logger.error(f"An error occured: {e}")
-                    await self.make_response(writer, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
+                    await self.handle_error(writer, HTTP_SERVER_ERROR, req)
                     return
             
             # Function callback
             if matched:
                 callback = self.routes[method][matched_route]
                 try:
-                    callback_result = callback(req, **route_params)
+                    callback_result = await self.dispatch_request(callback, req, **route_params)
                 except Exception as e:
                     self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
-                    self.logger.error(f"An error occured: {e}")
-                    await self.make_response(writer, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
+                    await self.handle_error(writer, HTTP_SERVER_ERROR, req)
                     return
             else:
                 target_file_path = None
@@ -444,31 +510,14 @@ class Lanes:
                     rel_path = path.lstrip("/")
                     target_file_path = os.path.join(self.config["static"]["path"], rel_path)
                 
-                await self.send_file(writer, method, target_file_path, path)
+                await self.send_file(writer, req, method, target_file_path, path)
                 return
             
-            response = Response()
-            
-            res_content: str | dict | list = ""
-            status = HTTP_OK
-            res_headers = {}
-
-            if isinstance(callback_result, tuple) and len(callback_result) == 2 and isinstance(callback_result[1], int):
-                response.status = callback_result[1]
-                callback_result = callback_result[0]
-
-            if isinstance(callback_result, Response):
-                response = callback_result
-            elif isinstance(callback_result, (dict, list)):
-                response.body = callback_result
-                response.content_type = MIME_TYPES["json"]
-            else:
-                response.body = str(callback_result)
-                response.content_type = MIME_TYPES["plain"]
+            response = await self.get_response(callback_result)
 
             await self.handle_response(writer, response)
 
-            self.logger.info(f"{method} {path} - {status} {HTTP_PHRASES[status]}")
+            self.logger.info(f"{method} {path} - {response.status} {HTTP_PHRASES[response.status]}")
         except Exception as e:
             self.logger.error(f"Handle request error: {e}")
         finally:
@@ -524,8 +573,8 @@ class Lanes:
     def register_blueprint(self, blueprint: Blueprint):
         url_prefix = blueprint.url_prefix
         # Register routes
-        for method in blueprint.routes.keys():
-            for path in blueprint.routes[method].keys():
+        for method in blueprint.routes:
+            for path in blueprint.routes[method]:
                 self.routes[method][url_prefix if path == "/" else url_prefix + path] = blueprint.routes[method][path]
         
         # Register middlewares
@@ -536,13 +585,13 @@ class Lanes:
 
     # Error handler registery functions
     def error_handler(self, status: int):
-        if status not in HTTP_PHRASES.keys():
+        if status not in HTTP_PHRASES:
             raise ValueError(f"Status {status} is not supported!")
         if not str(status).startswith(("4", "5")):
             raise ValueError(f"Status {status} is not an error status!")
         
         def wrapper(func):
-            self.error_handlers[status] = func
+            self.error_handlers[status].append(func)
             return func
         return wrapper
     
