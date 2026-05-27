@@ -28,7 +28,7 @@ HTTP_NOT_FOUND             = const(404)
 HTTP_METHOD_NOT_ALLOWED    = const(405)
 HTTP_SERVER_ERROR          = const(500)
 
-HTTP_ERROR_STATUSES = [HTTP_BAD_REQUEST, HTTP_UNAUTHORIZED, HTTP_NOT_FOUND, HTTP_METHOD_NOT_ALLOWED, HTTP_SERVER_ERROR]
+HTTP_ERROR_STATUSES = [400, 401, 402, 403, 404, 405, 500, 501, 502, 503, 504, 505]
 
 HTTP_PHRASES = {
     200: "OK",
@@ -218,7 +218,7 @@ class Lanes:
         }
         self.static_routes = {}
         self.middlewares = []
-        self.error_handlers: dict[int, list] = {}
+        self.error_handlers: dict[int, list] = {status: [] for status in HTTP_ERROR_STATUSES}
         self.logger = Logger(log_level)
         self.config["static"]["path"] = "./assets"
     
