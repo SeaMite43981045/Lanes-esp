@@ -9,7 +9,7 @@ except ImportError:
     def const(x):
         return x
 
-__version__ = "1.2.1-pre"
+__version__ = "1.2.2-pre"
 
 LOG_DEBUG = const(0)
 LOG_INFO  = const(1)
@@ -333,9 +333,14 @@ class Lanes:
                     callback_result = await self.dispatch_request(error_handler, req)
                     
                     if callback_result is not None:
+
                         response = await self.get_response(callback_result)
-                        await self.handle_response(writer, response)
-                        self.logger.info(f"{req.method} {req.path} - {status} {HTTP_PHRASES[status]}")
+
+                        if response.status == HTTP_OK:
+                            response.status = status
+
+                        await self.handle_response(writer, req, response)
+                        
                         return
                     
                 await self.make_response(writer, req, {"message": error_message}, MIME_TYPES["json"], status)
@@ -352,7 +357,7 @@ class Lanes:
             await self.make_response(writer, req, {"message": error_message}, MIME_TYPES["json"], status)
             return
         
-    async def handle_response(self, writer: asyncio.StreamWriter, response: Response):
+    async def handle_response(self, writer: asyncio.StreamWriter, request: Request, response: Response):
         status = response.status
         headers = response.headers
         body = response.body
@@ -363,7 +368,7 @@ class Lanes:
 
         headers["Content-Type"] = content_type
 
-        await self.make_response(writer, None, body, content_type, status, headers)
+        await self.make_response(writer, request, body, content_type, status, headers)
     
     async def get_response(self, callback_result):
         response = Response()
@@ -380,7 +385,7 @@ class Lanes:
         else:
             response.body = str(callback_result)
             response.content_type = MIME_TYPES["plain"]
-        
+
         return response
 
     async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -450,7 +455,6 @@ class Lanes:
             try:
                 body = json.loads(raw_body.decode())
             except ValueError:
-                self.logger.info(f"{method} {path} - {HTTP_BAD_REQUEST} {HTTP_PHRASES[HTTP_BAD_REQUEST]}")
                 await self.make_response(writer, None, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
                 return
 
@@ -483,8 +487,7 @@ class Lanes:
                     result = await self.dispatch_request(middleware, req)
                     if result is not None:
                         response = await self.get_response(result)
-                        await self.handle_response(writer, response)
-                        self.logger.info(f"{method} {path} - {response.status} {HTTP_PHRASES[response.status]}")
+                        await self.handle_response(writer, req, response)
                         return
                 except Exception as e:
                     await self.handle_error(writer, HTTP_SERVER_ERROR, req)
@@ -516,7 +519,7 @@ class Lanes:
             
             response = await self.get_response(callback_result)
 
-            await self.handle_response(writer, response)
+            await self.handle_response(writer, req, response)
 
             self.logger.info(f"{method} {path} - {response.status} {HTTP_PHRASES[response.status]}")
         except Exception as e:
