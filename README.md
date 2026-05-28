@@ -2,7 +2,7 @@
 
 Lanes is a lightweight, high-performance, asynchronous web framework designed specifically for **MicroPython** (optimized for ESP32 and similar resource-constrained microcontrollers). Inspired by modern desktop frameworks like Flask and Sanic, Lanes brings an expressive, decorator-based routing system and standard HTTP abstractions to the embedded world.
 
-**Current Version:** `1.2.2-pre`
+**Current Version:** `1.3.0-rc1`
 
 ---
 

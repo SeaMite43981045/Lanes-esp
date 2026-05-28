@@ -9,7 +9,7 @@ except ImportError:
     def const(x):
         return x
 
-__version__ = "1.2.2-pre"
+__version__ = "1.3.0-rc1"
 
 LOG_DEBUG = const(0)
 LOG_INFO  = const(1)
@@ -90,7 +90,7 @@ class Logger:
         self.output(LOG_FATAL, "[FATAL]", message)
 
 class Request:
-    def __init__(self, method, path, headers: dict, params, body):
+    def __init__(self, method: str, path: str, headers: dict, params: dict, body):
         self.method = method
         self.path = path
         self.headers = headers
@@ -230,6 +230,160 @@ class Lanes:
 
         self.static_routes[url_prefix] = folder_path
         self.logger.info(f"Register static directory: {url_prefix} -> {folder_path}")
+
+    def url_decode(self, s: str) -> str:
+        s = s.replace('+', ' ')
+        chunks = s.split('%')
+        if len(chunks) == 1:
+            return s
+        res = [chunks[0]]
+        for chunk in chunks[1:]:
+            try:
+                res.append(chr(int(chunk[:2], 16)) + chunk[2:])
+            except:
+                res.append('%' + chunk)
+        return "".join(res)
+
+    async def _parse_common_body(self, raw_body: bytes, content_type: str):
+        self.logger.debug(f"Parsing body with content type: {content_type}")
+
+        if not raw_body:
+            return None
+            
+        if "application/x-www-form-urlencoded" in content_type:
+            body = {}
+            for param in raw_body.decode('utf-8', 'ignore').split("&"):
+                if "=" in param:
+                    key, value = param.split("=", 1)
+                    body[self.url_decode(key)] = self.url_decode(value)
+            return body
+            
+        elif "application/json" in content_type:
+            try:
+                return json.loads(raw_body.decode())
+            except ValueError:
+                return raw_body.decode('utf-8', 'ignore')
+                
+        elif content_type.startswith("text/") or "application/javascript" in content_type:
+            return raw_body.decode('utf-8', 'ignore')
+            
+        return raw_body
+
+    async def _parse_multipart_form_data(self, reader: asyncio.StreamReader, content_type: str, content_length: int):
+        if "boundary=" not in content_type:
+            self.logger.error("No boundary found in multipart Content-Type")
+            return None
+
+        # 1. 提取并构建严格的字节边界
+        boundary = content_type.split("boundary=", 1)[1].strip()
+        boundary_bytes = b"--" + boundary.encode("utf-8")
+        end_boundary_bytes = boundary_bytes + b"--"
+
+        body = []
+        temp_dir = "./temp"
+
+        try:
+            os.mkdir(temp_dir)
+        except OSError:
+            pass
+
+        state = 0 # 0: Finding boundary, 1: Parsing headers, 2: Reading body
+        bytes_read = 0
+
+        data_name = ""
+        data_filename = ""
+        data_filetype = ""
+        
+        last_line = None
+        temp_file = None
+        body_buffer = bytearray()
+
+        while bytes_read < content_length:
+            raw_line = await reader.readline()
+            if not raw_line:
+                break
+            bytes_read += len(raw_line)
+
+            line_stripped = raw_line.rstrip(b"\r\n")
+
+            if state == 0:
+                if line_stripped == boundary_bytes:
+                    state = 1
+                elif line_stripped == end_boundary_bytes:
+                    break
+
+            elif state == 1:
+                if line_stripped == b"":
+                    if data_filename != "":
+                        tmp_path = os.path.join(temp_dir, f"up_{time.time_ns()}_{data_filename}")
+                        temp_file = open(tmp_path, "wb")
+                        self.logger.debug(f"Streaming file directly to flash: {tmp_path}")
+                    state = 2
+                    last_line = None
+                else:
+                    try:
+                        header_line = raw_line.decode().strip()
+                        if ":" in header_line:
+                            key, value = header_line.split(":", 1)
+                            key_lower = key.strip().lower()
+                            value_str = value.strip()
+                            
+                            if key_lower == "content-disposition":
+                                parts = value_str.split(";")
+                                for part in parts:
+                                    part = part.strip()
+                                    if part.startswith("name="):
+                                        data_name = part.split("=", 1)[1].strip('"')
+                                    elif part.startswith("filename="):
+                                        data_filename = part.split("=", 1)[1].strip('"')
+                            elif key_lower == "content-type":
+                                data_filetype = value_str
+                    except Exception as e:
+                        self.logger.error(f"Error parsing subset header: {e}")
+
+            elif state == 2:
+                if line_stripped == boundary_bytes or line_stripped == end_boundary_bytes:
+                    if last_line is not None:
+                        actual_last_data = last_line.rstrip(b"\r\n")
+                        if temp_file is not None:
+                            temp_file.write(actual_last_data)
+                        else:
+                            body_buffer.extend(actual_last_data)
+
+                    if temp_file is not None:
+                        temp_file.close()
+                        body.append({
+                            "name": data_name, 
+                            "filename": data_filename, 
+                            "filetype": data_filetype, 
+                            "tmp_path": tmp_path
+                        })
+                        temp_file = None
+                    else:
+                        body.append({
+                            "name": data_name, 
+                            "value": body_buffer.decode('utf-8', 'ignore')
+                        })
+                        body_buffer = bytearray()
+
+                    data_name = ""
+                    data_filename = ""
+                    data_filetype = ""
+                    last_line = None
+
+                    if line_stripped == end_boundary_bytes:
+                        break
+                    else:
+                        state = 1
+                else:
+                    if last_line is not None:
+                        if temp_file is not None:
+                            temp_file.write(last_line)
+                        else:
+                            body_buffer.extend(last_line)
+                    last_line = raw_line
+
+        return body
         
     def make_header(self, writer: asyncio.StreamWriter, status=HTTP_OK, headers = None):
         headers = headers if headers is not None else {}
@@ -254,10 +408,10 @@ class Lanes:
         body = None
         headers = headers if headers is not None else {}
         
-        if mime_type == MIME_TYPES["json"]:
+        if mime_type == MIME_TYPES["json"] or isinstance(data, (dict, list)):
             body = json.dumps(data)
         else:
-            body=data
+            body=str(data)
 
         headers["Content-Length"] = len(body)
         headers["Content-Type"] = mime_type
@@ -400,6 +554,7 @@ class Lanes:
 
             while True:
                 header_raw_line = await reader.readline()
+                self.logger.debug(f"header raw line: {header_raw_line}")
                 if header_raw_line == b'\r\n' or header_raw_line == b'\n' or not header_raw_line:
                     break
                 header_line = header_raw_line.decode().strip()
@@ -446,19 +601,20 @@ class Lanes:
                     break
 
             # Body handler
+            content_type = headers.get("content-type", "")
             content_length = int(headers.get("content-length", 0))
-            raw_body = b"{}"
+            raw_body = b""
             if content_length > 0:
-                raw_body = (await reader.read(content_length)).strip()
-            self.logger.debug(raw_body)
+                if "multipart/form-data" in content_type:
+                    body = await self._parse_multipart_form_data(reader, content_type, content_length)
+                else:
+                    raw_body = await reader.read(content_length)
+                    self.logger.debug(f"raw_body: {raw_body}")
+                    body = await self._parse_common_body(raw_body, content_type)
+            else:
+                body = None
 
-            try:
-                body = json.loads(raw_body.decode())
-            except ValueError:
-                await self.make_response(writer, None, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
-                return
-
-            self.logger.debug(body)
+            self.logger.debug(f"body: {body}")
 
             # Params parse
             params = {}
@@ -613,20 +769,22 @@ class Lanes:
         try:
             while True:
                 await asyncio.sleep(3600)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
         finally:
+            self.logger.debug("Shutting down the server...")
             server.close()
             await server.wait_closed()
-
-            self.logger.info("=================")
-            self.logger.info("Server is closed")
-            self.logger.info("=================")
     
     def run(self, host="0.0.0.0", port=80):
         self.config["server"]["host"] = host
         self.config["server"]["port"] = port
-        asyncio.run(self.run_server())
+        try:
+            asyncio.run(self.run_server())
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            self.logger.info("=================")
+            self.logger.info("Server is closed")
+            self.logger.info("=================")
 
 
 def render_template(path: str, **params):
