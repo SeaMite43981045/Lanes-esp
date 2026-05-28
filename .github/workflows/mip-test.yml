@@ -1,0 +1,18 @@
+name: Test mip Installation
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MicroPython
+        run: |
+          sudo apt update
+          sudo apt install -y micropython
+
+      - name: Test Installation via mip
+        run: |
+          micropython -c "import mip; mip.install('github:SeaMite43981045/Lanes-esp'); import lanes"
