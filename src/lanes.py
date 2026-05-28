@@ -250,7 +250,7 @@ class Lanes:
                 
         writer.write(b"\r\n")
 
-    async def make_response(self, writer: asyncio.StreamWriter, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, headers = None):
+    async def make_response(self, writer: asyncio.StreamWriter, req, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, headers = None):
         body = None
         headers = headers if headers is not None else {}
         
@@ -265,13 +265,14 @@ class Lanes:
         self.make_header(writer, status, headers)
         writer.write(body.encode())
 
+        if req != None:
+            self.logger.info(f"{req.method} {req.path} - {status} {HTTP_PHRASES[status]}")
         await writer.drain()
     
     async def send_file(self, writer: asyncio.StreamWriter, req: Request, method, file_path, path):
         self.logger.debug(f"target file path: {file_path}")
 
         if not os.path.exists(file_path):
-            self.logger.info(f"{method} {file_path} - {HTTP_NOT_FOUND} {HTTP_PHRASES[HTTP_NOT_FOUND]}")
             await self.handle_error(writer, HTTP_NOT_FOUND, req, f"Could not {method} {path}")
             return
 
@@ -287,6 +288,8 @@ class Lanes:
                     break
                 writer.write(buffer[:n])
                 await writer.drain()
+
+        self.logger.info(f"{method} {path} - {HTTP_OK} {HTTP_PHRASES[HTTP_OK]}")
     
     def match_path(self, route: str, path: str):
         route_chunk = route.split("/")
@@ -332,9 +335,10 @@ class Lanes:
                     if callback_result is not None:
                         response = await self.get_response(callback_result)
                         await self.handle_response(writer, response)
+                        self.logger.info(f"{req.method} {req.path} - {status} {HTTP_PHRASES[status]}")
                         return
                     
-                await self.make_response(writer, {"message": error_message}, MIME_TYPES["json"], status)
+                await self.make_response(writer, req, {"message": error_message}, MIME_TYPES["json"], status)
                 return
             except Exception as e:
                 self.logger.error(f"An error occurred in custom error handler: {e}")
@@ -342,10 +346,10 @@ class Lanes:
                     await self.handle_error(writer, HTTP_SERVER_ERROR, req)
                     return
                 else:
-                    await self.make_response(writer, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
+                    await self.make_response(writer, req, {"message": "Internal error"}, MIME_TYPES["json"], HTTP_SERVER_ERROR)
                     return
         else:
-            await self.make_response(writer, {"message": error_message}, MIME_TYPES["json"], status)
+            await self.make_response(writer, req, {"message": error_message}, MIME_TYPES["json"], status)
             return
         
     async def handle_response(self, writer: asyncio.StreamWriter, response: Response):
@@ -359,7 +363,7 @@ class Lanes:
 
         headers["Content-Type"] = content_type
 
-        await self.make_response(writer, body, content_type, status, headers)
+        await self.make_response(writer, None, body, content_type, status, headers)
     
     async def get_response(self, callback_result):
         response = Response()
@@ -402,7 +406,7 @@ class Lanes:
             request_chunk = request_line.split(" ")
 
             if len(request_chunk) != 3:
-                await self.make_response(writer, {"message": "Bad request"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
+                await self.make_response(writer, None, {"message": "Bad request"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
                 return
             
             method = request_chunk[0].upper()
@@ -447,7 +451,7 @@ class Lanes:
                 body = json.loads(raw_body.decode())
             except ValueError:
                 self.logger.info(f"{method} {path} - {HTTP_BAD_REQUEST} {HTTP_PHRASES[HTTP_BAD_REQUEST]}")
-                await self.make_response(writer, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
+                await self.make_response(writer, None, {"message": "Wrong body struct"}, MIME_TYPES["json"], HTTP_BAD_REQUEST)
                 return
 
             self.logger.debug(body)
@@ -465,7 +469,6 @@ class Lanes:
             req = Request(method, path, headers, params, body)
 
             if method not in METHODS:
-                self.logger.info(f"{method} {path} - {HTTP_METHOD_NOT_ALLOWED} {HTTP_PHRASES[HTTP_METHOD_NOT_ALLOWED]}")
                 await self.handle_error(writer, HTTP_METHOD_NOT_ALLOWED, req)
                 return
             if method == METHOD_OPTIONS:
@@ -484,7 +487,6 @@ class Lanes:
                         self.logger.info(f"{method} {path} - {response.status} {HTTP_PHRASES[response.status]}")
                         return
                 except Exception as e:
-                    self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
                     await self.handle_error(writer, HTTP_SERVER_ERROR, req)
                     return
             
@@ -494,7 +496,6 @@ class Lanes:
                 try:
                     callback_result = await self.dispatch_request(callback, req, **route_params)
                 except Exception as e:
-                    self.logger.info(f"{method} {path} - {HTTP_SERVER_ERROR} {HTTP_PHRASES[HTTP_SERVER_ERROR]}")
                     await self.handle_error(writer, HTTP_SERVER_ERROR, req)
                     return
             else:
