@@ -71,23 +71,40 @@ class Logger:
         self.log_level = log_level
     
     def output(self, log_level, prefix, message):
-        if (log_level >= self.log_level):
-            print(f"[{get_time_str()}] {prefix} -", message)
+        print(f"[{get_time_str()}] {prefix} -", message)
 
-    def debug(self, message):
-        self.output(LOG_DEBUG, "[DEBUG]", message)
+    def should_log(self, level):
+        return level >= self.log_level
 
-    def info(self, message):
-        self.output(LOG_INFO, "[INFO] ", message)
+    def debug(self, message, *args):
+        if self.should_log(LOG_DEBUG):
+            if args:
+                message = message % args
+            self.output(LOG_DEBUG, "[DEBUG]", message)
 
-    def warn(self, message):
-        self.output(LOG_WARN, "[WARN] ", message)
+    def info(self, message, *args):
+        if self.should_log(LOG_INFO):
+            if args:
+                message = message % args
+            self.output(LOG_INFO, "[INFO]", message)
 
-    def error(self, message):
-        self.output(LOG_ERROR, "[ERROR]", message)
+    def warn(self, message, *args):
+        if self.should_log(LOG_WARN):
+            if args:
+                message = message % args
+            self.output(LOG_WARN, "[WARN]", message)
 
-    def fatal(self, message):
-        self.output(LOG_FATAL, "[FATAL]", message)
+    def error(self, message, *args):
+        if self.should_log(LOG_ERROR):
+            if args:
+                message = message % args
+            self.output(LOG_ERROR, "[ERROR]", message)
+
+    def fatal(self, message, *args):
+        if self.should_log(LOG_FATAL):
+            if args:
+                message = message % args
+            self.output(LOG_FATAL, "[FATAL]", message)
 
 class Request:
     def __init__(self, method: str, path: str, headers: dict, params: dict, body):
@@ -122,9 +139,10 @@ class Response:
         self.headers = headers
         self.status = status
         self.content_type = content_type
-        self._cookies = []
 
     def set_cookie(self, key, value, max_age=None, path="/", httponly=False, secure=False):
+        if not hasattr(self, '_cookies'):
+            self._cookies = []
         cookie_parts = [f"{key}={value}"]
         
         if path:
@@ -198,11 +216,11 @@ class Blueprint:
 class Lanes:
     config = {
         "server": {
-            "host": str,
-            "port": int
+            "host": "0.0.0.0",
+            "port": 80
         },
         "static": {
-            "path": str
+            "path": "./assets"
         }
     }
 
@@ -218,7 +236,7 @@ class Lanes:
         }
         self.static_routes = {}
         self.middlewares = []
-        self.error_handlers: dict[int, list] = {status: [] for status in HTTP_ERROR_STATUSES}
+        self.error_handlers: dict[int, list] = {}
         self.logger = Logger(log_level)
         self.config["static"]["path"] = "./assets"
     
@@ -229,7 +247,7 @@ class Lanes:
             url_prefix = url_prefix.rstrip("/")
 
         self.static_routes[url_prefix] = folder_path
-        self.logger.info(f"Register static directory: {url_prefix} -> {folder_path}")
+        self.logger.info("Register static directory: %s -> %s", url_prefix, folder_path)
 
     def url_decode(self, s: str) -> str:
         s = s.replace('+', ' ')
@@ -245,7 +263,7 @@ class Lanes:
         return "".join(res)
 
     async def _parse_common_body(self, raw_body: bytes, content_type: str):
-        self.logger.debug(f"Parsing body with content type: {content_type}")
+        self.logger.debug("Parsing body with content type: %s", content_type)
 
         if not raw_body:
             return None
@@ -260,7 +278,7 @@ class Lanes:
             
         elif "application/json" in content_type:
             try:
-                return json.loads(raw_body.decode())
+                return json.loads(raw_body)
             except ValueError:
                 return raw_body.decode('utf-8', 'ignore')
                 
@@ -274,7 +292,6 @@ class Lanes:
             self.logger.error("No boundary found in multipart Content-Type")
             return None
 
-        # 1. 提取并构建严格的字节边界
         boundary = content_type.split("boundary=", 1)[1].strip()
         boundary_bytes = b"--" + boundary.encode("utf-8")
         end_boundary_bytes = boundary_bytes + b"--"
@@ -317,7 +334,7 @@ class Lanes:
                     if data_filename != "":
                         tmp_path = os.path.join(temp_dir, f"up_{time.time_ns()}_{data_filename}")
                         temp_file = open(tmp_path, "wb")
-                        self.logger.debug(f"Streaming file directly to flash: {tmp_path}")
+                        self.logger.debug("Streaming file directly to flash: %s", tmp_path)
                     state = 2
                     last_line = None
                 else:
@@ -339,7 +356,7 @@ class Lanes:
                             elif key_lower == "content-type":
                                 data_filetype = value_str
                     except Exception as e:
-                        self.logger.error(f"Error parsing subset header: {e}")
+                        self.logger.error("Error parsing subset header: %s", e)
 
             elif state == 2:
                 if line_stripped == boundary_bytes or line_stripped == end_boundary_bytes:
@@ -404,27 +421,27 @@ class Lanes:
                 
         writer.write(b"\r\n")
 
-    async def make_response(self, writer: asyncio.StreamWriter, req, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, headers = None):
-        body = None
+    async def make_response(self, writer: asyncio.StreamWriter, req: Request | None, data, mime_type=MIME_TYPES["plain"], status = HTTP_OK, headers = None):
         headers = headers if headers is not None else {}
         
-        if mime_type == MIME_TYPES["json"] or isinstance(data, (dict, list)):
-            body = json.dumps(data)
+        if isinstance(data, (dict, list)):
+            body = json.dumps(data).encode()
+            mime_type = MIME_TYPES["json"]
         else:
-            body=str(data)
+            body=str(data).encode()
 
         headers["Content-Length"] = len(body)
         headers["Content-Type"] = mime_type
         
         self.make_header(writer, status, headers)
-        writer.write(body.encode())
+        writer.write(body)
 
         if req != None:
-            self.logger.info(f"{req.method} {req.path} - {status} {HTTP_PHRASES[status]}")
+            self.logger.info("%s %s - %d %s", req.method, req.path, status, HTTP_PHRASES[status])
         await writer.drain()
     
     async def send_file(self, writer: asyncio.StreamWriter, req: Request, method, file_path, path):
-        self.logger.debug(f"target file path: {file_path}")
+        self.logger.debug("target file path: %s", file_path)
 
         if not os.path.exists(file_path):
             await self.handle_error(writer, HTTP_NOT_FOUND, req, f"Could not {method} {path}")
@@ -443,27 +460,40 @@ class Lanes:
                 writer.write(buffer[:n])
                 await writer.drain()
 
-        self.logger.info(f"{method} {path} - {HTTP_OK} {HTTP_PHRASES[HTTP_OK]}")
-    
-    def match_path(self, route: str, path: str):
-        route_chunk = route.split("/")
-        path_chunk = path.split("/")
+        self.logger.info("%s %s - %d %s", method, path, HTTP_OK, HTTP_PHRASES[HTTP_OK])
 
+    def match_path(self, route: str, path: str):
         params = {}
 
-        if len(route_chunk) != len(path_chunk):
-            return (False, params)
-        
-        for i in range(len(route_chunk)):
-            if (route_chunk[i].startswith(":")):
-                param_key = route_chunk[i].replace(":", "", 1)
-                param_val = path_chunk[i].split("?", 1)[0]
+        i, j = 0, 0
+        while i < len(route) and j < len(path):
+            if route[i] == "/":
+                i += 1
+            if path[j] == "/":
+                j += 1
 
+            r_end = route.find("/", i)
+            if r_end == -1:
+                r_end = len(route)
+            p_end = path.find("/", j)
+            if p_end == -1:
+                p_end = len(path)
+
+            if route[i] == ":":
+                
+                param_key = route[i+1:r_end]
+                param_val = path[j:p_end]
                 params[param_key] = param_val
             else:
-                if route_chunk[i] != path_chunk[i]:
+                if route[i:r_end] != path[j:p_end]:
                     return (False, params)
+            
+            i = r_end
+            j = p_end
         
+        if i != len(route) or j != len(path):
+            return (False, params)
+
         return (True, params)
     
     async def dispatch_request(self, handler, req, **kwargs):
@@ -500,7 +530,7 @@ class Lanes:
                 await self.make_response(writer, req, {"message": error_message}, MIME_TYPES["json"], status)
                 return
             except Exception as e:
-                self.logger.error(f"An error occurred in custom error handler: {e}")
+                self.logger.error("An error occurred in custom error handler: %s", e)
                 if status != HTTP_SERVER_ERROR:
                     await self.handle_error(writer, HTTP_SERVER_ERROR, req)
                     return
@@ -517,7 +547,7 @@ class Lanes:
         body = response.body
         content_type = response.content_type
 
-        if response._cookies:
+        if hasattr(response, '_cookies'):
             headers["Set-Cookie"] = response._cookies
 
         headers["Content-Type"] = content_type
@@ -525,20 +555,24 @@ class Lanes:
         await self.make_response(writer, request, body, content_type, status, headers)
     
     async def get_response(self, callback_result):
-        response = Response()
+        status = HTTP_OK
 
         if isinstance(callback_result, tuple) and len(callback_result) == 2 and isinstance(callback_result[1], int):
-            response.status = callback_result[1]
+            status = callback_result[1]
             callback_result = callback_result[0]
 
         if isinstance(callback_result, Response):
             response = callback_result
-        elif isinstance(callback_result, (dict, list)):
-            response.body = callback_result
-            response.content_type = MIME_TYPES["json"]
         else:
-            response.body = str(callback_result)
-            response.content_type = MIME_TYPES["plain"]
+            response = Response()
+            if isinstance(callback_result, (dict, list)):
+                response.body = callback_result
+                response.content_type = MIME_TYPES["json"]
+            else:
+                response.body = str(callback_result)
+                response.content_type = MIME_TYPES["plain"]
+
+        response.status = status
 
         return response
 
@@ -550,11 +584,11 @@ class Lanes:
             
             request_line = raw_line.decode().strip()
             headers = {}
-            self.logger.debug(f"request line: {request_line}")
+            self.logger.debug("request line: %s", request_line)
 
             while True:
                 header_raw_line = await reader.readline()
-                self.logger.debug(f"header raw line: {header_raw_line}")
+                self.logger.debug("header raw line: %s", header_raw_line)
                 if header_raw_line == b'\r\n' or header_raw_line == b'\n' or not header_raw_line:
                     break
                 header_line = header_raw_line.decode().strip()
@@ -586,7 +620,7 @@ class Lanes:
             if path.endswith("/") and path != "/":
                 path = path.removesuffix("/")
             
-            self.logger.debug(f"method: {method} path: {path} protocol: {protocol}")
+            self.logger.debug("method: %s path: %s protocol: %s", method, path, protocol)
             
             route_params = {}
             matched = False
@@ -609,12 +643,12 @@ class Lanes:
                     body = await self._parse_multipart_form_data(reader, content_type, content_length)
                 else:
                     raw_body = await reader.read(content_length)
-                    self.logger.debug(f"raw_body: {raw_body}")
+                    self.logger.debug("raw_body: %s", raw_body)
                     body = await self._parse_common_body(raw_body, content_type)
             else:
                 body = None
 
-            self.logger.debug(f"body: {body}")
+            self.logger.debug("body: %s", body)
 
             # Params parse
             params = {}
@@ -632,7 +666,7 @@ class Lanes:
                 await self.handle_error(writer, HTTP_METHOD_NOT_ALLOWED, req)
                 return
             if method == METHOD_OPTIONS:
-                self.logger.info(f"{method} {path} - {HTTP_NO_CONTENT} {HTTP_PHRASES[HTTP_NO_CONTENT]}")
+                self.logger.info("%s %s - %s %s", method, path, HTTP_NO_CONTENT, HTTP_PHRASES[HTTP_NO_CONTENT])
                 self.make_header(writer, HTTP_NO_CONTENT)
                 await writer.drain()
                 return
@@ -677,9 +711,9 @@ class Lanes:
 
             await self.handle_response(writer, req, response)
 
-            self.logger.info(f"{method} {path} - {response.status} {HTTP_PHRASES[response.status]}")
+            self.logger.info("%s %s - %s %s", method, path, response.status, HTTP_PHRASES[response.status])
         except Exception as e:
-            self.logger.error(f"Handle request error: {e}")
+            self.logger.error("Handle request error: %s", e)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -741,7 +775,7 @@ class Lanes:
         for middleware in blueprint.middlewares:
             self.middlewares.append(middleware)
 
-        self.logger.info("Register blueprint: " + url_prefix)
+        self.logger.info("Register blueprint: %s", url_prefix)
 
     # Error handler registery functions
     def error_handler(self, status: int):
@@ -751,7 +785,10 @@ class Lanes:
             raise ValueError(f"Status {status} is not an error status!")
         
         def wrapper(func):
-            self.error_handlers[status].append(func)
+            try:
+                self.error_handlers[status].append(func)
+            except KeyError:
+                self.error_handlers.setdefault(status, []).append(func)
             return func
         return wrapper
     
@@ -761,11 +798,11 @@ class Lanes:
         server = await asyncio.start_server(self.handle_request, host, port)
 
         self.logger.info("=======================================")
-        self.logger.info("The server is running on: {}:{}".format(host, port))
+        self.logger.info("The server is running on: %s:%s", host, port)
         self.logger.info("=======================================")
 
-        self.logger.debug(f"routes: {self.routes}")
-        
+        self.logger.debug("routes: %s", self.routes)
+
         try:
             while True:
                 await asyncio.sleep(3600)
@@ -792,12 +829,12 @@ def render_template(path: str, **params):
         raise FileNotFoundError(f"Template '{path}' not found!")
     
     with open(path, "r", encoding="utf-8") as f:
-        template = f.read()
-    
-    for key, value in params.items():
-        placeholder = "{{ " + key + " }}"
-        template = template.replace(placeholder, str(value))
+        result = []
+        for line in f:
+            for key, value in params.items():
+                placeholder = "{{ " + key + " }}"
+                line = line.replace(placeholder, str(value))
+            result.append(line)
 
-    res = Response(template, content_type=MIME_TYPES["html"])
-    
+    res = Response("".join(result), content_type=MIME_TYPES["html"])
     return res
