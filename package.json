@@ -1,6 +1,6 @@
 {
     "name": "lanes",
-    "version": "1.3.0-rc1",
+    "version": "1.3.0",
     "description": "A simple and efficient Python web framework built on top of asyncio.",
     "urls": [
         ["lanes.py", "github:SeaMite43981045/Lanes-esp/src/lanes.py"]

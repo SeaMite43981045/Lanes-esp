@@ -9,7 +9,7 @@ except ImportError:
     def const(x):
         return x
 
-__version__ = "1.3.0-rc1"
+__version__ = "1.3.0"
 
 LOG_DEBUG = const(0)
 LOG_INFO  = const(1)
